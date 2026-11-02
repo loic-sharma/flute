@@ -1,0 +1,25 @@
+name: flutter_flute
+description: An agent-first CLI for driving Flutter apps, plus the in-app support it needs.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.9.0
+  flutter: ">=3.35.0"
+
+dependencies:
+  args: ^2.5.0
+  flutter:
+    sdk: flutter
+  flutter_driver:
+    sdk: flutter
+  flutter_test:
+    sdk: flutter
+  path: ^1.9.0
+  vm_service: any # Pinned by the Flutter SDK through flutter_driver.
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+
+executables:
+  flute: flute
