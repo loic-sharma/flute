@@ -76,6 +76,55 @@ void main() {
     expect(hello['protocol'], fluteProtocolVersion);
   });
 
+  testWidgets('dump semantics lists children in traversal order', (WidgetTester tester) async {
+    final SemanticsHandle handle = tester.ensureSemantics();
+    // Paint order is Bottom, then Top; a screen reader reads Top first.
+    // Flutter sorts by position only under a node with a text direction.
+    await tester.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: Semantics(
+          container: true,
+          textDirection: TextDirection.ltr,
+          child: Stack(
+            children: <Widget>[
+              Positioned(
+                top: 200,
+                left: 0,
+                child: Semantics(
+                  container: true,
+                  label: 'Bottom',
+                  child: const SizedBox(width: 100, height: 40),
+                ),
+              ),
+              Positioned(
+                top: 0,
+                left: 0,
+                child: Semantics(
+                  container: true,
+                  label: 'Top',
+                  child: const SizedBox(width: 100, height: 40),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    final Map<String, dynamic> dump = await _call(
+      FluteDumpSemanticsExtension(),
+      const FluteDumpSemantics(),
+      tester,
+    );
+    final List<String> labels = <String>[
+      for (final String line in formatSemantics(dump))
+        if (line.contains('"')) line.substring(line.indexOf('"')),
+    ];
+    expect(labels, <String>['"Top"', '"Bottom"']);
+    handle.dispose();
+  });
+
   testWidgets('dump semantics returns nodes with global rects', (WidgetTester tester) async {
     final SemanticsHandle handle = tester.ensureSemantics();
     await tester.pumpWidget(_App(onGo: () {}));

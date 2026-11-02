@@ -23,14 +23,15 @@ List<Map<String, Object?>> dumpSemanticsTrees() {
 
 Map<String, Object?> _describeNode(SemanticsNode node, double devicePixelRatio) {
   final SemanticsData data = node.getSemanticsData();
-  final children = <Map<String, Object?>>[];
-  node.visitChildren((SemanticsNode child) {
-    // Merged children are already folded into this node's data.
-    if (!child.isMergedIntoParent) {
-      children.add(_describeNode(child, devicePixelRatio));
-    }
-    return true;
-  });
+  // Traversal order, the order a screen reader follows. visitChildren would
+  // give paint order, which puts an app bar after the body it overlays.
+  final children = <Map<String, Object?>>[
+    for (final SemanticsNode child in node.debugListChildrenInOrder(
+      DebugSemanticsDumpOrder.traversalOrder,
+    ))
+      // Merged children are already folded into this node's data.
+      if (!child.isMergedIntoParent) _describeNode(child, devicePixelRatio),
+  ];
   final Rect rect = globalRect(node, devicePixelRatio);
   return <String, Object?>{
     'id': node.id,
