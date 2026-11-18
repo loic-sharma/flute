@@ -38,9 +38,14 @@ class DaemonClient {
   late final Stream<String> _lines;
 
   /// Connects to the session's daemon, or returns null if none is running.
-  static Future<DaemonClient?> connect(SessionPaths paths) async {
+  ///
+  /// With [trace], says what it found under `--verbose`.
+  static Future<DaemonClient?> connect(SessionPaths paths, {bool trace = true}) async {
     final DaemonInfo? info = DaemonInfo.read(paths);
     if (info == null) {
+      if (trace) {
+        Verbose.log('no daemon: ${paths.daemonJson.path} is missing or unreadable');
+      }
       return null;
     }
     try {
@@ -49,8 +54,16 @@ class DaemonClient {
         info.port,
         timeout: const Duration(seconds: 2),
       );
+      if (trace) {
+        Verbose.log('connected to daemon pid ${info.pid} on 127.0.0.1:${info.port}');
+      }
       return DaemonClient._(socket, info);
-    } on SocketException {
+    } on SocketException catch (e) {
+      if (trace) {
+        Verbose.log(
+          'no daemon: pid ${info.pid} on port ${info.port} does not answer (${e.message})',
+        );
+      }
       return null;
     }
   }
@@ -65,6 +78,8 @@ class DaemonClient {
   }) async {
     out ??= stdout;
     err ??= stderr;
+    final watch = Stopwatch()..start();
+    Verbose.log('sending $method ${jsonEncode(params)}');
     _socket.writeln(
       jsonEncode(<String, Object?>{
         'id': 1,
@@ -83,6 +98,7 @@ class DaemonClient {
       }
       if (message.containsKey('exit')) {
         await _socket.close();
+        Verbose.log('$method exited ${message['exit']} after ${watch.elapsedMilliseconds}ms');
         return message['exit']! as int;
       }
       final Object? output = message['output'];
@@ -126,17 +142,20 @@ Future<DaemonClient> connectOrSpawn(SessionPaths paths, {required Duration idleT
     // A compiled `flute` executable is its own script.
     final String script = Platform.script.toFilePath();
     final bool compiled = script == Platform.resolvedExecutable;
+    final args = <String>[
+      if (!compiled) ...await _vmArguments(),
+      if (!compiled) script,
+      'daemon',
+      '--session',
+      paths.name,
+      '--idle-timeout',
+      formatDuration(idleTimeout),
+    ];
+    Verbose.log('starting daemon: ${Platform.resolvedExecutable} ${args.join(' ')}');
+    final watch = Stopwatch()..start();
     await Process.start(
       Platform.resolvedExecutable,
-      <String>[
-        if (!compiled) ...await _vmArguments(),
-        if (!compiled) script,
-        'daemon',
-        '--session',
-        paths.name,
-        '--idle-timeout',
-        formatDuration(idleTimeout),
-      ],
+      args,
       mode: ProcessStartMode.detached,
       workingDirectory: paths.directory.path,
     );
@@ -144,8 +163,9 @@ Future<DaemonClient> connectOrSpawn(SessionPaths paths, {required Duration idleT
     final deadline = DateTime.now().add(const Duration(seconds: 10));
     while (DateTime.now().isBefore(deadline)) {
       await Future<void>.delayed(const Duration(milliseconds: 100));
-      final DaemonClient? client = await DaemonClient.connect(paths);
+      final DaemonClient? client = await DaemonClient.connect(paths, trace: false);
       if (client != null) {
+        Verbose.log('daemon answered after ${watch.elapsedMilliseconds}ms');
         return client;
       }
     }

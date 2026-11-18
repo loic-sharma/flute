@@ -51,7 +51,10 @@ The app's code does not change. `flute run` writes an entrypoint to
 
 Every command takes `--session <name>` (default `default`, or
 `FLUTE_SESSION`) and `--timeout <duration>` (default `10s`; `5m` for `run` and
-`attach`).
+`attach`). `-v`/`--verbose` adds detail on stderr, each line starting with
+`verbose:`: which daemon was used or started, each Flutter Driver command with
+its timing, and the `flutter` tool's own output during `run` and reloads.
+`flute <command> --help` describes a command and its options.
 
 | Command | What it does |
 | --- | --- |

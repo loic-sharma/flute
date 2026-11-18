@@ -80,6 +80,18 @@ class Daemon {
   bool _stopping = false;
   bool _shuttingDown = false;
 
+  /// The request being handled, and whether it asked for `--verbose`.
+  /// Requests run one at a time, so there is at most one.
+  Reply? _current;
+  bool _verbose = false;
+
+  /// Sends [message] to the CLI on stderr if the current request is verbose.
+  void _trace(String message) {
+    if (_verbose) {
+      _current?.err('$verbosePrefix$message');
+    }
+  }
+
   /// Recent app output, for error banners.
   final List<String> _recentAppLines = <String>[];
   int _appLinesSeen = 0;
@@ -188,7 +200,15 @@ class Daemon {
         return;
       }
       _idleTimer?.cancel();
-      final int code = await _run(method, params, reply);
+      _current = reply;
+      _verbose = params['verbose'] == true;
+      final int code;
+      try {
+        code = await _run(method, params, reply);
+      } finally {
+        _current = null;
+        _verbose = false;
+      }
       reply.exit(code);
       await socket.flush().catchError((Object _) {});
       if (method == 'quit' || (_app == null && !_shuttingDown && method != 'ping')) {
@@ -292,18 +312,21 @@ class Daemon {
     _startNewAppLog();
 
     final String entrypoint = project.writeEntrypoint(target);
+    _trace('project ${project.name} in ${project.directory}; wrote $entrypoint for $target');
     final String? device = params['device'] as String?;
     final List<String> extra = (params['flutterArgs'] as List<Object?>? ?? const <Object?>[])
         .cast<String>();
+    final args = <String>[
+      'run',
+      '--machine',
+      if (device != null) ...<String>['-d', device],
+      '-t',
+      entrypoint,
+      ...extra,
+    ];
+    _trace('starting ${flutterExecutable()} ${args.join(' ')}');
     final tool = await FlutterTool.start(
-      <String>[
-        'run',
-        '--machine',
-        if (device != null) ...<String>['-d', device],
-        '-t',
-        entrypoint,
-        ...extra,
-      ],
+      args,
       workingDirectory: project.directory,
       attached: false,
     );
@@ -322,18 +345,16 @@ class Daemon {
     }
     _startNewAppLog();
 
-    final tool = await FlutterTool.start(
-      <String>[
-        'attach',
-        '--machine',
-        '--debug-url',
-        uri,
-        if (device != null) ...<String>['-d', device],
-        if (target != null) ...<String>['-t', target],
-      ],
-      workingDirectory: project.directory,
-      attached: true,
-    );
+    final args = <String>[
+      'attach',
+      '--machine',
+      '--debug-url',
+      uri,
+      if (device != null) ...<String>['-d', device],
+      if (target != null) ...<String>['-t', target],
+    ];
+    _trace('starting ${flutterExecutable()} ${args.join(' ')} in ${project.directory}');
+    final tool = await FlutterTool.start(args, workingDirectory: project.directory, attached: true);
     return _connectTool(
       project,
       tool,
@@ -354,7 +375,11 @@ class Daemon {
   }) async {
     tool
       ..onProgress = reply.out
-      ..onToolLog = (String line) => log('flutter: $line');
+      ..onToolLog = (String line) {
+        log('flutter: $line');
+        // Full build and reload output, for verbose run, reload and restart.
+        _trace('flutter: $line');
+      };
 
     try {
       await tool.started.timeout(timeout);
@@ -423,6 +448,8 @@ class Daemon {
   /// Connects Flutter Driver, checks the protocol version, and sets up the
   /// session's defaults.
   Future<void> _connectDriver(_App app) async {
+    _trace('connecting Flutter Driver to ${app.wsUri}');
+    final watch = Stopwatch()..start();
     final Future<FlutterDriver> connecting = FlutterDriver.connect(
       dartVmServiceUrl: app.wsUri,
       logCommunicationToFile: false,
@@ -436,6 +463,7 @@ class Daemon {
         hint: 'Is the app built with flutter_flute? Run: flute logs',
       );
     }
+    _trace('driver connected in ${watch.elapsedMilliseconds}ms');
 
     final Map<String, dynamic> hello = await _send(
       app,
@@ -455,8 +483,8 @@ class Daemon {
     app.platform = hello['platform'] as String? ?? 'unknown';
     await _listenToAppOutput(app);
     await _setPubRoot(app);
-    await app.driver.sendCommand(const SetSemantics(true));
-    await app.driver.sendCommand(const SetFrameSync(false));
+    await _send(app, const SetSemantics(true), const Duration(seconds: 10));
+    await _send(app, const SetFrameSync(false), const Duration(seconds: 10));
   }
 
   /// Captures the app's output from the VM service's Stdout and Stderr
@@ -689,12 +717,25 @@ class Daemon {
   /// Sends [command] and returns its result, turning app-side failures into
   /// [FluteException]s.
   Future<Map<String, dynamic>> _send(_App app, Command command, Duration timeout) async {
+    final Map<String, String> args = command.serialize()..remove('command');
+    _trace('→ ${command.kind}${args.isEmpty ? '' : ' ${jsonEncode(args)}'}');
+    final watch = Stopwatch()..start();
     final Map<String, dynamic> result;
     try {
       result = await app.driver.sendCommand(command).timeout(timeout + const Duration(seconds: 1));
     } on DriverError catch (e) {
+      _trace(
+        '← ${command.kind} failed after ${watch.elapsedMilliseconds}ms: ${_firstLine(e.message)}',
+      );
       throw _driverFailure(app, e);
+    } on TimeoutException {
+      _trace('← ${command.kind} timed out after ${watch.elapsedMilliseconds}ms');
+      rethrow;
     }
+    // Results can be whole trees; report their size, not their contents.
+    _trace(
+      '← ${command.kind} in ${watch.elapsedMilliseconds}ms, ${jsonEncode(result).length} bytes',
+    );
     final Object? error = result['error'];
     if (error is String) {
       throw FluteException(
@@ -739,7 +780,9 @@ class Daemon {
         FluteWaitIdle(budget),
         budget + const Duration(seconds: 1),
       );
-      return result['idle'] == true;
+      final bool idle = result['idle'] == true;
+      _trace(idle ? 'app is idle' : 'app still busy after ${formatDuration(budget)}; going ahead');
+      return idle;
     } on FluteException {
       return false;
     } on TimeoutException {
@@ -923,6 +966,7 @@ class Daemon {
     await _waitIdle(app, _actionIdleBudget);
 
     if (app.isMobile) {
+      _trace('device capture: flutter screenshot -d ${app.deviceId} -o $path');
       final ProcessResult result = await Process.run(
         flutterExecutable(),
         <String>['screenshot', '-d', app.deviceId, '-o', path],
@@ -948,6 +992,7 @@ class Daemon {
         );
       } on FluteException catch (e) {
         log('wait_rasterized failed (${e.message}); falling back to a 2s delay');
+        _trace('no rasterized frame reported (${e.message}); waiting 2s instead');
         await Future<void>.delayed(const Duration(seconds: 2));
       }
       final Map<String, dynamic> result = await _send(

@@ -25,6 +25,21 @@ class FluteException implements Exception {
   String toString() => message;
 }
 
+/// Prefix for `--verbose` lines, so they are easy to tell from output.
+const String verbosePrefix = 'verbose: ';
+
+/// Detail printed to stderr when the CLI runs with `--verbose`.
+abstract final class Verbose {
+  static bool enabled = false;
+
+  /// Prints [message] to stderr if `--verbose` is on.
+  static void log(String message) {
+    if (enabled) {
+      stderr.writeln('$verbosePrefix$message');
+    }
+  }
+}
+
 /// The directory that holds all sessions.
 ///
 /// `FLUTE_HOME` overrides the default, which tests use to stay isolated.

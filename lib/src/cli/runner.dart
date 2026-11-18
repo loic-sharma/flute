@@ -6,83 +6,11 @@ import 'package:args/args.dart';
 import '../daemon/daemon.dart';
 import 'client.dart';
 import 'common.dart';
+import 'usage.dart';
 
 const Duration _defaultTimeout = Duration(seconds: 10);
 const Duration _defaultRunTimeout = Duration(minutes: 5);
 const Duration _defaultIdleTimeout = Duration(minutes: 30);
-
-const String _usage = '''
-flute: drive a running Flutter app from the shell.
-
-Usage: flute <command> [arguments] [--session <name>] [--timeout <duration>]
-
-Commands:
-  run [-d <device>] [-t <target>] [-- <flutter args>]
-                                   Start the app (replaces the session's app)
-  attach <vm-service-uri> [-d <device>]
-                                   Connect to a running app that has flutter_flute
-  quit                             Stop the app and the session's daemon
-  reload                           Hot reload
-  restart                          Hot restart; earlier refs become stale
-  dump app [--depth <n>] [--under <ref>]
-                                   Widget tree, pruned to the app's own widgets
-  dump semantics [-i]              Semantics tree with s#<id> refs
-  screenshot [<path>]              Save a PNG of the app
-  tap <ref>                        Tap a semantics node
-  fill <ref> <text>                Tap a text field and replace its content
-  find <finder> <value> [tap | fill <text>] [--first]
-                                   Find widgets by text, key, label, type or tooltip
-  wait <finder> <value> [--gone]   Wait until a widget appears or disappears
-  wait idle                        Wait until no frames are pending
-  logs [--tail <n>]                App output since launch
-  sessions                         List live sessions
-
-Exit codes: 0 success, 1 failure, 2 usage error, 3 no app in the session.''';
-
-ArgParser _commonParser() {
-  return ArgParser()
-    ..addOption('session', defaultsTo: Platform.environment['FLUTE_SESSION'] ?? 'default')
-    ..addOption('timeout')
-    ..addFlag('help', abbr: 'h', negatable: false);
-}
-
-ArgParser _buildParser() {
-  final ArgParser parser = _commonParser();
-  final ArgParser dumpParser = _commonParser()
-    ..addFlag('interactive', abbr: 'i', negatable: false)
-    ..addOption('depth')
-    ..addOption('under')
-    ..addOption('max-lines');
-  parser
-    ..addCommand(
-      'run',
-      _commonParser()
-        ..addOption('device', abbr: 'd')
-        ..addOption('target', abbr: 't')
-        ..addOption('idle-timeout'),
-    )
-    ..addCommand(
-      'attach',
-      _commonParser()
-        ..addOption('device', abbr: 'd')
-        ..addOption('target', abbr: 't')
-        ..addOption('idle-timeout'),
-    )
-    ..addCommand('quit', _commonParser())
-    ..addCommand('reload', _commonParser())
-    ..addCommand('restart', _commonParser())
-    ..addCommand('dump', dumpParser)
-    ..addCommand('screenshot', _commonParser())
-    ..addCommand('tap', _commonParser())
-    ..addCommand('fill', _commonParser())
-    ..addCommand('find', _commonParser()..addFlag('first', negatable: false))
-    ..addCommand('wait', _commonParser()..addFlag('gone', negatable: false))
-    ..addCommand('logs', _commonParser()..addOption('tail'))
-    ..addCommand('sessions', _commonParser())
-    ..addCommand('help', _commonParser())
-    ..addCommand('daemon', _commonParser()..addOption('idle-timeout'));
-  return parser;
-}
 
 /// Runs the `flute` CLI and returns its exit code.
 Future<int> runFlute(List<String> arguments) async {
@@ -96,36 +24,84 @@ Future<int> runFlute(List<String> arguments) async {
     }
     return e.exitCode;
   } on FormatException catch (e) {
+    // Bad options, such as an unknown flag or a missing option value.
     stderr.writeln('✗ ${e.message}');
-    stderr.writeln('Run: flute help');
+    final String? name = arguments.where((String a) => findCommand(a) != null).firstOrNull;
+    stderr.writeln(name == null || name == 'help' ? 'Run: flute help' : 'Run: flute $name --help');
     return ExitCode.usage;
   }
 }
 
-Future<int> _run(List<String> arguments) async {
-  final ArgResults top = _buildParser().parse(arguments);
+/// Returns the help text for [arguments] if they ask for help, else null.
+///
+/// Throws a usage [FluteException] for `flute help <unknown>`.
+({String text, int exitCode})? helpFor(ArgResults top, {required bool hadArguments}) {
   final ArgResults? command = top.command;
-  if (command == null || command.name == 'help' || top.flag('help') || command.flag('help')) {
-    stdout.writeln(_usage);
-    return command == null && !top.flag('help') && arguments.isNotEmpty
-        ? ExitCode.usage
-        : ExitCode.success;
+  if (command == null) {
+    // Bare `flute` is a usage error; `flute --help` is not.
+    return (
+      text: generalUsage(),
+      exitCode: top.flag('help') || !hadArguments ? ExitCode.success : ExitCode.usage,
+    );
   }
+  if (command.name == 'help') {
+    if (command.rest.isEmpty) {
+      return (text: generalUsage(), exitCode: ExitCode.success);
+    }
+    final CommandSpec? spec = findCommand(command.rest.first);
+    if (spec == null || command.rest.length > 1) {
+      throw FluteException(
+        'Unknown command "${command.rest.join(' ')}".',
+        hint: 'Run: flute help',
+        exitCode: ExitCode.usage,
+      );
+    }
+    return (text: commandUsage(spec), exitCode: ExitCode.success);
+  }
+  if (command.flag('help')) {
+    return (text: commandUsage(findCommand(command.name!)!), exitCode: ExitCode.success);
+  }
+  if (top.flag('help')) {
+    // `flute --help tap` reads as help for tap.
+    return (text: commandUsage(findCommand(command.name!)!), exitCode: ExitCode.success);
+  }
+  return null;
+}
+
+Future<int> _run(List<String> arguments) async {
+  final ArgResults top = buildParser().parse(arguments);
+  final ({String text, int exitCode})? help = helpFor(top, hadArguments: arguments.isNotEmpty);
+  if (help != null) {
+    (help.exitCode == ExitCode.success ? stdout : stderr).writeln(help.text);
+    return help.exitCode;
+  }
+  final ArgResults command = top.command!;
 
   // Options may come before or after the command name.
-  String option(String name) => command.wasParsed(name) ? command.option(name)! : top.option(name)!;
   String? optionalOption(String name) => command.wasParsed(name)
       ? command.option(name)
       : (top.wasParsed(name) ? top.option(name) : null);
 
-  final paths = SessionPaths(option('session'));
+  final paths = SessionPaths(
+    optionalOption('session') ?? Platform.environment['FLUTE_SESSION'] ?? 'default',
+  );
   final String name = command.name!;
   final List<String> rest = command.rest;
   final String? timeoutText = optionalOption('timeout');
   final Duration timeout = timeoutText != null
       ? parseDuration(timeoutText)
       : (name == 'run' || name == 'attach' ? _defaultRunTimeout : _defaultTimeout);
-  final params = <String, Object?>{'timeout': timeout.inMilliseconds};
+  Verbose.enabled = command.flag('verbose') || top.flag('verbose');
+  final params = <String, Object?>{
+    'timeout': timeout.inMilliseconds,
+    if (Verbose.enabled) 'verbose': true,
+  };
+  if (name != 'sessions') {
+    // `sessions` looks at all of them; this line would only mislead.
+    Verbose.log(
+      'session "${paths.name}" in ${paths.directory.path}, timeout ${formatDuration(timeout)}',
+    );
+  }
 
   switch (name) {
     case 'daemon':
@@ -251,7 +227,11 @@ Future<int> _run(List<String> arguments) async {
 
 void _expectArgs(List<String> rest, int count, String usage) {
   if (rest.length != count) {
-    throw FluteException('Usage: flute $usage', exitCode: ExitCode.usage);
+    throw FluteException(
+      'Usage: flute $usage',
+      hint: 'Run: flute ${usage.split(' ').first} --help',
+      exitCode: ExitCode.usage,
+    );
   }
 }
 
@@ -273,6 +253,11 @@ Future<int> _send(SessionPaths paths, String method, Map<String, Object?> params
 }
 
 int _reportNoApp(SessionPaths paths) {
+  Verbose.log(
+    paths.exitJson.existsSync()
+        ? 'no daemon; ${paths.exitJson.path} records how the last app exited'
+        : 'no daemon and no ${paths.exitJson.path}',
+  );
   if (paths.exitJson.existsSync()) {
     try {
       final json = jsonDecode(paths.exitJson.readAsStringSync()) as Map<String, Object?>;
@@ -297,8 +282,13 @@ List<String> _readLog(SessionPaths paths) {
   final lines = <String>[];
   for (final file in <File>[File('${paths.appLog.path}.1'), paths.appLog]) {
     if (file.existsSync()) {
-      lines.addAll(const LineSplitter().convert(file.readAsStringSync()));
+      final List<String> fileLines = const LineSplitter().convert(file.readAsStringSync());
+      Verbose.log('read ${fileLines.length} lines from ${file.path}');
+      lines.addAll(fileLines);
     }
+  }
+  if (!paths.appLog.existsSync()) {
+    Verbose.log('no ${paths.appLog.path} yet');
   }
   return lines;
 }
@@ -321,6 +311,7 @@ int _logs(SessionPaths paths, int? tail) {
 Future<int> _sessions() async {
   final Directory root = SessionPaths.root;
   final live = <String>[];
+  Verbose.log('looking for sessions in ${root.path}');
   if (root.existsSync()) {
     final List<Directory> dirs = root.listSync().whereType<Directory>().toList()
       ..sort((Directory a, Directory b) => a.path.compareTo(b.path));
@@ -332,11 +323,13 @@ Future<int> _sessions() async {
       } on FluteException {
         continue;
       }
-      final DaemonClient? client = await DaemonClient.connect(paths);
+      final DaemonClient? client = await DaemonClient.connect(paths, trace: false);
       if (client == null) {
+        Verbose.log('$name: no live daemon');
         continue;
       }
       final (int code, String status) = await client.requestText('status');
+      Verbose.log('$name: status exited $code');
       if (code == ExitCode.success) {
         live.add('$name: $status');
       }
